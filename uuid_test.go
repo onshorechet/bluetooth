@@ -71,3 +71,22 @@ func BenchmarkUUIDToString(b *testing.B) {
 		_ = uuid.String()
 	}
 }
+
+func BenchmarkUUIDParse(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_, err := ParseUUID("00001234-0000-1000-8000-00805f9b34fb")
+		if err != nil {
+			b.Errorf("expected nil but got %v", err)
+		}
+	}
+}
+
+func BenchmarkUUIDUnmarshalText(b *testing.B) {
+	var uuid UUID
+	for i := 0; i < b.N; i++ {
+		err := uuid.UnmarshalText([]byte("00001234-0000-1000-8000-00805f9b34fb"))
+		if err != nil {
+			b.Errorf("expected nil but got %v", err)
+		}
+	}
+}

@@ -6,8 +6,10 @@
 package bluetooth
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -23,6 +25,9 @@ type Adapter struct {
 	address              string
 	defaultAdvertisement *Advertisement
 
+	devicesMu sync.Mutex // protects the devices map
+	devices   map[dbus.ObjectPath]*Device
+
 	connectHandler func(device Device, connected bool)
 }
 
@@ -33,6 +38,7 @@ func NewAdapter(id string) *Adapter {
 	return &Adapter{
 		id:             id,
 		connectHandler: func(device Device, connected bool) {},
+		devices:        make(map[dbus.ObjectPath]*Device),
 	}
 }
 
@@ -44,7 +50,7 @@ var DefaultAdapter = NewAdapter(defaultAdapter)
 
 // Enable configures the BLE stack. It must be called before any
 // Bluetooth-related calls (unless otherwise indicated).
-func (a *Adapter) Enable() (err error) {
+func (a *Adapter) EnableWithContext(ctx context.Context) (err error) {
 	bus, err := dbus.SystemBus()
 	if err != nil {
 		return err
@@ -60,8 +66,67 @@ func (a *Adapter) Enable() (err error) {
 		return fmt.Errorf("could not activate BlueZ adapter: %w", err)
 	}
 	addr.Store(&a.address)
+	return a.enablePropsChangedWatch(ctx)
+}
+
+func (a *Adapter) Enable() (err error) {
+	return a.EnableWithContext(context.Background())
+}
+
+func (a *Adapter) enablePropsChangedWatch(ctx context.Context) (err error) {
+	// Already start watching for property changes. We do this before reading
+	// the Connected property below to avoid a race condition: if the device
+	// were connected between the two calls the signal wouldn't be picked up.
+	signal := make(chan *dbus.Signal)
+	a.bus.Signal(signal)
+	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
+	a.bus.AddMatchSignal(propertiesChangedMatchOptions...)
+
+	// Wait until the device has connected.
+	go func() {
+		defer close(signal)
+		defer a.bus.RemoveMatchSignal(propertiesChangedMatchOptions...)
+		defer a.bus.RemoveSignal(signal)
+		for {
+			select {
+			case sig := <-signal:
+				switch sig.Name {
+				case "org.freedesktop.DBus.Properties.PropertiesChanged":
+					a.handlePropertiesChanged(sig)
+				}
+			case <-ctx.Done():
+				err = errors.New("bluetooth: failed to connect: context canceled")
+				return
+			}
+		}
+	}()
 
 	return nil
+}
+
+func (a *Adapter) handlePropertiesChanged(sig *dbus.Signal) {
+	interfaceName := sig.Body[0].(string)
+	if interfaceName != "org.bluez.Device1" {
+		return
+	}
+
+	a.devicesMu.Lock()
+	defer a.devicesMu.Unlock()
+	if _, ok := a.devices[sig.Path]; !ok {
+		return
+	}
+
+	changes := sig.Body[1].(map[string]dbus.Variant)
+	connected, ok := changes["Connected"].Value().(bool)
+	if !ok {
+		return
+	}
+
+	if !connected {
+		a.devices[sig.Path].link.disconnect()
+	}
+
+	a.devices[sig.Path].link.connect()
 }
 
 func (a *Adapter) Address() (MACAddress, error) {

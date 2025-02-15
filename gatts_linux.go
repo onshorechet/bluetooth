@@ -48,8 +48,10 @@ func (om *objectManager) GetManagedObjects() (map[dbus.ObjectPath]map[string]map
 // DBus. Here is the documentation:
 // https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc/org.bluez.GattCharacteristic.rst
 type bluezChar struct {
-	props      *prop.Properties
-	writeEvent func(client Connection, offset int, value []byte)
+	props            *prop.Properties
+	writeEvent       func(client Connection, offset int, value []byte)
+	startNotifyEvent func()
+	stopNotifyEvent  func()
 }
 
 func (c *bluezChar) ReadValue(options map[string]dbus.Variant) ([]byte, *dbus.Error) {
@@ -67,6 +69,20 @@ func (c *bluezChar) WriteValue(value []byte, options map[string]dbus.Variant) *d
 		client := Connection(0)
 		offset, _ := options["offset"].Value().(uint16)
 		c.writeEvent(client, int(offset), value)
+	}
+	return nil
+}
+
+func (c *bluezChar) StartNotify() *dbus.Error {
+	if c.startNotifyEvent != nil {
+		c.startNotifyEvent()
+	}
+	return nil
+}
+
+func (c *bluezChar) StopNotify() *dbus.Error {
+	if c.stopNotifyEvent != nil {
+		c.stopNotifyEvent()
 	}
 	return nil
 }
@@ -101,9 +117,9 @@ func (a *Adapter) AddService(s *Service) error {
 			"indicate",               // bit 5
 		}
 		var flags []string
-		for i := 0; i < len(bluezCharFlags); i++ {
-			if (char.Flags>>i)&1 != 0 {
-				flags = append(flags, bluezCharFlags[i])
+		for j := 0; j < len(bluezCharFlags); j++ {
+			if (char.Flags>>j)&1 != 0 {
+				flags = append(flags, bluezCharFlags[j])
 			}
 		}
 
@@ -125,8 +141,10 @@ func (a *Adapter) AddService(s *Service) error {
 
 		// Export the methods of this characteristic.
 		obj := &bluezChar{
-			props:      props,
-			writeEvent: char.WriteEvent,
+			props:            props,
+			writeEvent:       char.WriteEvent,
+			startNotifyEvent: char.StartNotifyEvent,
+			stopNotifyEvent:  char.StopNotifyEvent,
 		}
 		err = a.bus.Export(obj, charPath, "org.bluez.GattCharacteristic1")
 		if err != nil {

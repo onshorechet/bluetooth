@@ -17,9 +17,11 @@ type WriteEvent = func(client Connection, offset int, value []byte)
 type CharacteristicConfig struct {
 	Handle *Characteristic
 	UUID
-	Value      []byte
-	Flags      CharacteristicPermissions
-	WriteEvent WriteEvent
+	Value            []byte
+	Flags            CharacteristicPermissions
+	WriteEvent       WriteEvent
+	StartNotifyEvent func()
+	StopNotifyEvent  func()
 }
 
 // CharacteristicPermissions lists a number of basic permissions/capabilities

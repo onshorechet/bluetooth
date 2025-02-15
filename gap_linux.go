@@ -3,17 +3,21 @@
 package bluetooth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
 )
 
-var errAdvertisementNotStarted = errors.New("bluetooth: advertisement is not started")
-var errAdvertisementAlreadyStarted = errors.New("bluetooth: advertisement is already started")
+var (
+	errAdvertisementNotStarted     = errors.New("bluetooth: advertisement is not started")
+	errAdvertisementAlreadyStarted = errors.New("bluetooth: advertisement is already started")
+)
 
 // Unique ID per advertisement (to generate a unique object path).
 var advertisementID uint64
@@ -54,7 +58,7 @@ func (a *Advertisement) Configure(options AdvertisementOptions) error {
 	for _, uuid := range options.ServiceUUIDs {
 		serviceUUIDs = append(serviceUUIDs, uuid.String())
 	}
-	var serviceData = make(map[string]interface{})
+	serviceData := make(map[string]interface{})
 	for _, element := range options.ServiceData {
 		serviceData[element.UUID.String()] = element.Data
 	}
@@ -158,6 +162,7 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 
 	signal := make(chan *dbus.Signal)
 	a.bus.Signal(signal)
+	defer close(signal)
 	defer a.bus.RemoveSignal(signal)
 
 	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
@@ -330,65 +335,61 @@ type Device struct {
 
 	device  dbus.BusObject // bluez device interface
 	adapter *Adapter       // the adapter that was used to form this device connection
+
+	link *deviceConnection
+}
+
+type deviceConnection struct {
+	mu        sync.Mutex // protects connection contexts
+	connected bool
+
+	connection    chan struct{} // of chan struct{}
+	disconnection chan struct{} // of chan struct{}
 }
 
 // Connect starts a connection attempt to the given peripheral device address.
 //
 // On Linux and Windows, the IsRandom part of the address is ignored.
 func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, error) {
-	devicePath := dbus.ObjectPath(string(a.adapter.Path()) + "/dev_" + strings.Replace(address.MAC.String(), ":", "_", -1))
-	device := Device{
+	return a.ConnectWithContext(context.Background(), address, params)
+}
+
+func (a *Adapter) Device(address Address) Device {
+	devicePath := dbus.ObjectPath(string(a.adapter.Path()) + "/dev_" + strings.ReplaceAll(address.String(), ":", "_"))
+	a.devicesMu.Lock()
+	defer a.devicesMu.Unlock()
+	if d, ok := a.devices[devicePath]; ok {
+		return *d
+	}
+
+	closedChan := make(chan struct{})
+	close(closedChan)
+
+	a.devices[devicePath] = &Device{
 		Address: address,
 		device:  a.bus.Object("org.bluez", devicePath),
 		adapter: a,
+		link: &deviceConnection{
+			connection:    make(chan struct{}),
+			disconnection: closedChan,
+		},
 	}
 
-	// Already start watching for property changes. We do this before reading
-	// the Connected property below to avoid a race condition: if the device
-	// were connected between the two calls the signal wouldn't be picked up.
-	signal := make(chan *dbus.Signal)
-	a.bus.Signal(signal)
-	defer close(signal)
-	defer a.bus.RemoveSignal(signal)
-	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
-	a.bus.AddMatchSignal(propertiesChangedMatchOptions...)
-	defer a.bus.RemoveMatchSignal(propertiesChangedMatchOptions...)
+	return *a.devices[devicePath]
+}
 
-	// Read whether this device is already connected.
-	connected, err := device.device.GetProperty("org.bluez.Device1.Connected")
+func (a *Adapter) ConnectWithContext(ctx context.Context, address Address, params ConnectionParams) (Device, error) {
+	device := a.Device(address)
+	err := device.Connect()
 	if err != nil {
 		return Device{}, err
 	}
 
-	// Connect to the device, if not already connected.
-	if !connected.Value().(bool) {
-		// Start connecting (async).
-		err := device.device.Call("org.bluez.Device1.Connect", 0).Err
-		if err != nil {
-			return Device{}, fmt.Errorf("bluetooth: failed to connect: %w", err)
-		}
-
-		// Wait until the device has connected.
-		connectChan := make(chan struct{})
-		go func() {
-			for sig := range signal {
-				switch sig.Name {
-				case "org.freedesktop.DBus.Properties.PropertiesChanged":
-					interfaceName := sig.Body[0].(string)
-					if interfaceName != "org.bluez.Device1" {
-						continue
-					}
-					if sig.Path != device.device.Path() {
-						continue
-					}
-					changes := sig.Body[1].(map[string]dbus.Variant)
-					if connected, ok := changes["Connected"].Value().(bool); ok && connected {
-						close(connectChan)
-					}
-				}
-			}
-		}()
-		<-connectChan
+	select {
+	case <-ctx.Done():
+		device.Disconnect()
+		return Device{}, errors.New("context closed before connection could be established")
+	case <-device.Connected():
 	}
 
 	if a.connectHandler != nil {
@@ -396,6 +397,76 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	}
 
 	return device, nil
+}
+
+func (d Device) Connected() <-chan struct{} {
+	return d.link.Connected()
+}
+
+func (d Device) Disconnected() <-chan struct{} {
+	return d.link.Disconnected()
+}
+
+func (d *deviceConnection) connect() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.connected {
+		return
+	}
+
+	d.connected = true
+	close(d.connection)
+
+	d.disconnection = make(chan struct{})
+}
+
+func (d *deviceConnection) Connected() <-chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.connection
+}
+
+func (d *deviceConnection) disconnect() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if !d.connected {
+		return
+	}
+
+	d.connected = false
+	close(d.disconnection)
+
+	d.connection = make(chan struct{})
+}
+
+func (d *deviceConnection) Disconnected() <-chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.disconnection
+}
+
+func (d Device) Connect() error {
+	// Read whether this device is already connected.
+	connected, err := d.device.GetProperty("org.bluez.Device1.Connected")
+	if err != nil {
+		return err
+	}
+
+	// Connect to the device, if not already connected.
+	if connected.Value().(bool) {
+		d.link.connect()
+		return nil
+	}
+
+	// Start connecting (async).
+	err = d.device.Call("org.bluez.Device1.Connect", 0).Err
+	if err != nil {
+		return fmt.Errorf("bluetooth: failed to connect: %w", err)
+	}
+
+	return nil
 }
 
 // Disconnect from the BLE device. This method is non-blocking and does not

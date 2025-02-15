@@ -278,7 +278,12 @@ func (c *DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) er
 			return nil
 		}
 
-		err := c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
+		err := c.characteristic.Call("org.bluez.GattCharacteristic1.StopNotify", 0).Err
+		if err != nil {
+			return err
+		}
+
+		err = c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
 		c.adapter.bus.RemoveSignal(c.property)
 		close(c.property)
 		c.property = nil
@@ -293,6 +298,14 @@ func (c DeviceCharacteristic) GetMTU() (uint16, error) {
 		return uint16(0), err
 	}
 	return mtu.Value().(uint16), nil
+}
+
+func (c DeviceCharacteristic) GetFlags() ([]string, error) {
+	flags, err := c.characteristic.GetProperty("org.bluez.GattCharacteristic1.Flags")
+	if err != nil {
+		return []string{}, err
+	}
+	return flags.Value().([]string), nil
 }
 
 // Read reads the current characteristic value.
